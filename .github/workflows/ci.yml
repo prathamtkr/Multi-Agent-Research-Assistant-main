@@ -1,0 +1,434 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        # pgvector, not stock postgres: migration 0006 enables the extension and 0007
+        # creates a vector column, so a stock image fails the migration step outright
+        # (docs/14 §3). Same pin as the compose files, for the same reason.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ci" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      ENVIRONMENT: test
+      LLM_MODE: fake
+      JWT_SECRET_KEY: ci-secret-0123456789abcdef0123456789abcdef
+      DATABASE_URL: postgresql+asyncpg://ci:ci@localhost:5432/ci
+      REDIS_URL: redis://localhost:6379/1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install system deps (WeasyPrint)
+        uses: ./.github/actions/apt-install
+        # Hard ceiling over the action's own per-attempt bounds, and it has to be sized
+        # from them: 2 attempts x (update + install) at 900s each. A ceiling that cuts
+        # in before the retry does makes the retry dead code — the shell job burned its
+        # 12 minutes on attempt 1 plus the start of attempt 2's refresh and reported the
+        # step timing out, which names neither stage.
+        timeout-minutes: 35
+        with:
+          packages: libpango-1.0-0 libpangoft2-1.0-0
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Lint
+        run: ruff check app/ research_engine/ tests/ evals/
+      - name: Format check
+        run: ruff format --check app/ research_engine/ tests/ evals/
+      - name: Migrations apply (schema built purely from Alembic)
+        run: alembic upgrade head
+      - name: Migration round-trip (populated database, both directions)
+        # The reverse direction, which nothing exercised until A9 and which was broken:
+        # `0008_chat_threads` dropped a constraint name the metadata convention had already
+        # rendered, so every downgrade past that revision died on any database.
+        #
+        # No new service and no second framework — this is the same `pgvector/pgvector:pg16`
+        # and the same `DATABASE_URL` the job already has. The suite creates and drops a
+        # scratch database of its own on that server, so it cannot disturb the `ci` database
+        # the step above just migrated.
+        #
+        # **The skip check is the point of running it as its own step.** These tests skip
+        # with a reason when no server answers, which is right on a laptop and wrong here:
+        # pytest exits 0 on a fully-skipped run, so a green tick would mean "the migration
+        # gate never ran" and nobody would know. Failing on a skip is what makes the service
+        # a requirement rather than a hope. The tests themselves are unchanged.
+        run: |
+          set -o pipefail
+          python -m pytest \
+            tests/workflow/test_migration_round_trip.py \
+            tests/task/test_migration_downgrade_policy.py \
+            tests/workflow/test_desktop_column_sync.py \
+            -v --tb=short | tee migration-gate.log
+          if grep -qE "[0-9]+ skipped" migration-gate.log; then
+            echo "::error::the migration gate skipped tests — the PostgreSQL service is"\
+                 "expected here, so a skip means it was unreachable, not that it was optional"
+            exit 1
+          fi
+      - name: Tests
+        run: python -m pytest tests/ -v --tb=short
+      - name: Dependency audit (non-blocking, docs/08 §4)
+        continue-on-error: true
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Markdown safety guard (docs/06 §5)
+        run: |
+          ! grep -rn --include='*.tsx' --include='*.ts' -e 'rehype-raw' -e 'dangerouslySetInnerHTML' app/ components/ lib/ hooks/ || \
+          (echo '::error::Banned pattern found (rehype-raw / dangerouslySetInnerHTML)'; exit 1)
+      - name: Token hygiene guard (docs/03, docs/07 "Theming")
+        run: |
+          set -e
+          fail=0
+          if grep -rnE '#[0-9a-fA-F]{3,8}\b' --include='*.tsx' --include='*.ts' app/ components/ lib/ hooks/; then
+            echo '::error::Hardcoded hex color found — use a design token (docs/07 "Theming")'; fail=1
+          fi
+          if grep -rnE 'localhost:8000|NEXT_PUBLIC_API_URL|127\.0\.0\.1:8000' --include='*.tsx' --include='*.ts' app/ components/ lib/ hooks/; then
+            echo '::error::Hardcoded backend URL found — call the same-origin /api proxy (docs/06 §6)'; fail=1
+          fi
+          # Matches real access (`localStorage.getItem`, `sessionStorage["k"]`), not prose
+          # mentioning it, and skips lines carrying an explicit opt-out. The rule exists to
+          # keep *auth* out of web storage (docs/03); it was banning every client-side
+          # preference too, which is a different thing and is why this check has been
+          # failing on main since M16. An opt-out must state a reason on the same line, so
+          # each one is reviewable rather than invisible.
+          if grep -rnE '(local|session)Storage\s*[.[]' --include='*.tsx' --include='*.ts' \
+               app/ components/ lib/ hooks/ | grep -v 'ci-allow-web-storage'; then
+            echo '::error::Web storage use found — auth is httpOnly cookies only (docs/03). If this is a non-auth UI preference, mark the line `ci-allow-web-storage: <reason>`'; fail=1
+          fi
+          exit $fail
+      - name: Unit tests (Vitest)
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Build (desktop static export)
+        # The second of three targets. `next.config.ts` branches on NEXT_PUBLIC_PAGES then
+        # NEXT_PUBLIC_DESKTOP, so a flag read at build time compiles the other branches
+        # out — which means a branch is only ever exercised by the target that builds it.
+        run: npm run build:desktop
+      - name: Build (Pages static export)
+        # The third target, and until M0B the only one CI never ran: `pages.yml` builds it
+        # on push to main, i.e. *after* review. A change that broke the public site
+        # therefore went green on the pull request and red on the deploy.
+        #
+        # Built the same way pages.yml does — from a copy with the authenticated routes
+        # removed — because `app/(app)` and `/login` need a backend and a session, and
+        # `build:pages` must not run `prepare-session-routes` (it recreates
+        # `app/(app)/session`, whose web variant has no `generateStaticParams` and fails
+        # the export outright).
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/pages && mkdir -p /tmp/pages
+          cp -R "$GITHUB_WORKSPACE/frontend" /tmp/pages/frontend
+          cp -R "$GITHUB_WORKSPACE/docs" /tmp/pages/docs
+          rm -rf "/tmp/pages/frontend/app/(app)" /tmp/pages/frontend/app/login
+          rm -rf /tmp/pages/frontend/.next /tmp/pages/frontend/out
+          cd /tmp/pages/frontend
+          NEXT_PUBLIC_BASE_PATH="/${{ github.event.repository.name }}" npm run build:pages
+      - name: Docs publication boundary holds in the export
+        # The unit tests assert the walk withholds governance and planning directories.
+        # This asserts it about the bytes actually produced: a route generated for one of
+        # them is a private document on the public internet, which is the failure M0B
+        # exists to make impossible.
+        run: |
+          set -euo pipefail
+          out=/tmp/pages/frontend/out
+          leaked=$(find "$out/docs" -mindepth 1 -type d \( -name governance -o -name plans \) -print)
+          if [ -n "$leaked" ]; then
+            echo "::error::Governance/planning docs were published:"; echo "$leaked"; exit 1
+          fi
+          test -s "$out/docs/index.html"
+          echo "docs pages exported: $(find "$out/docs" -name index.html | wc -l)"
+      - name: Dependency audit (non-blocking, docs/08 §4)
+        continue-on-error: true
+        run: npm audit --audit-level=critical
+
+  version-consistency:
+    name: One version, everywhere
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      # No dependencies: the script reads files and compares strings. Keeping it that way
+      # is deliberate — a consistency check that needs the app to import is a check that
+      # stops running the moment the app stops importing.
+      - name: VERSION agrees with every derived constant
+        run: python scripts/sync_version.py
+      - name: Release-content invariants hold (RELEASE.md, the audit's `ci` stage)
+        # The part of the release audit that needs nothing but the checkout: every version a
+        # user can read is a reviewed one, measurements name their evidence, every guard a
+        # past release incident added to a workflow is still there, the deploy path pulls a
+        # released image. Per commit, because each of these went stale between releases.
+        run: python scripts/release_audit.py --stage ci
+
+  golden-e2e:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    services:
+      postgres:
+        # pgvector, not stock postgres: migration 0006 enables the extension and 0007
+        # creates a vector column, so a stock image fails the migration step outright
+        # (docs/14 §3). Same pin as the compose files, for the same reason.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ci" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      ENVIRONMENT: test
+      LLM_MODE: fake
+      JWT_SECRET_KEY: ci-secret-0123456789abcdef0123456789abcdef
+      DATABASE_URL: postgresql+asyncpg://ci:ci@localhost:5432/ci
+      REDIS_URL: redis://localhost:6379/1
+      BACKEND_ORIGIN: http://localhost:8000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install system deps (WeasyPrint)
+        uses: ./.github/actions/apt-install
+        # Hard ceiling over the action's own per-attempt bounds, and it has to be sized
+        # from them: 2 attempts x (update + install) at 900s each. A ceiling that cuts
+        # in before the retry does makes the retry dead code — the shell job burned its
+        # 12 minutes on attempt 1 plus the start of attempt 2's refresh and reported the
+        # step timing out, which names neither stage.
+        timeout-minutes: 35
+        with:
+          packages: libpango-1.0-0 libpangoft2-1.0-0
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+      - name: Apply migrations
+        working-directory: backend
+        run: alembic upgrade head
+      - name: Start API (fake-LLM)
+        working-directory: backend
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level warning &
+          echo $! > /tmp/api.pid
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health && break || sleep 1;
+          done
+      - name: Start Celery worker (fake-LLM)
+        working-directory: backend
+        run: |
+          # Readiness is checked, not assumed. The API and the frontend steps both poll
+          # until they answer; this one slept 5 seconds and hoped — for a worker that
+          # imports LangGraph, LangChain and every provider client before it consumes
+          # anything. When that took longer than 5s (or the worker died on boot, which
+          # `&` hides completely) the job carried on, research tasks sat unconsumed in
+          # the queue, no agent_logs rows were ever written, and the golden journeys
+          # failed with the live feed stuck on "Waiting for the pipeline to start…".
+          # That is a nondeterministic failure whose symptom points at SSE rather than
+          # at the worker, which is why it read as flaky for so long.
+          celery -A app.workers.celery_app.celery_app worker --concurrency=1 --loglevel=info \
+            > /tmp/worker.log 2>&1 &
+          echo $! > /tmp/worker.pid
+          for i in $(seq 1 60); do
+            if celery -A app.workers.celery_app.celery_app inspect ping -t 2 >/dev/null 2>&1; then
+              echo "worker ready after ${i}s"; break
+            fi
+            if ! kill -0 "$(cat /tmp/worker.pid)" 2>/dev/null; then
+              echo "::error::Celery worker exited during startup"; cat /tmp/worker.log; exit 1
+            fi
+            sleep 1
+          done
+          celery -A app.workers.celery_app.celery_app inspect ping -t 5 || {
+            echo "::error::Celery worker never became ready"; cat /tmp/worker.log; exit 1
+          }
+          # A ping is not readiness. It answers while LangGraph and the provider clients
+          # are still importing inside the worker, which measurably cost 35s on the FIRST
+          # task and 0.26s on the second (run 31958153365). The journeys then started
+          # against a worker that could not run anything yet and failed on "Waiting for
+          # the pipeline to start…" — blaming SSE for a worker that was still booting.
+          # The preload signal is what makes ready mean ready; wait for it to land.
+          for i in $(seq 1 120); do
+            grep -q "worker_preload_complete" /tmp/worker.log && { echo "preloaded after ${i}s"; break; }
+            if ! kill -0 "$(cat /tmp/worker.pid)" 2>/dev/null; then
+              echo "::error::Celery worker exited while preloading"; cat /tmp/worker.log; exit 1
+            fi
+            sleep 1
+          done
+          grep -q "worker_preload_complete" /tmp/worker.log || {
+            echo "::error::Worker never finished preloading the pipeline imports"
+            cat /tmp/worker.log; exit 1
+          }
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Resolve the Playwright version for the cache key
+        id: pw
+        working-directory: frontend
+        # Keyed on the resolved version rather than the lockfile hash: the browser
+        # build is tied to @playwright/test's version and nothing else in the lockfile,
+        # so an unrelated dependency bump must not evict a perfectly good browser.
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Cache the Playwright browser
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+      - name: Playwright system libraries
+        uses: ./.github/actions/apt-install
+        # This is what `playwright install --with-deps` used to do for us, and the reason
+        # it no longer does it: `--with-deps` shells out to a raw `apt-get` that the
+        # bounded action never saw, so the one apt path left in this workflow was also
+        # the only unbounded one. It hung for the full ten minutes of the browser step's
+        # budget and reported nothing, on the same runner pool and in the same window
+        # that wedged the Tauri shell job's apt.
+        #
+        # Regenerate with `npx playwright install-deps --dry-run chromium`, which prints
+        # exactly this list. Pinning it here costs a refresh when Playwright adds a
+        # dependency — and buys a browser that fails to launch with a named missing
+        # library instead of a download that stalls silently.
+        timeout-minutes: 35
+        with:
+          packages: >-
+            libasound2-data libasound2t64 libcups2t64 libdrm-amdgpu1 libdrm-common
+            libdrm-intel1 libdrm2 libnss3 xserver-common xvfb
+      - name: Install Playwright browser
+        working-directory: frontend
+        # Bounded because this is the largest network fetch in CI — ~184 MB of Chrome
+        # from cdn.playwright.dev — and on 2026-08-19 two consecutive runners wedged on
+        # it, the second for 3h40m against a normal 17s, on course to burn the whole
+        # 6-hour job timeout. Same lesson as the apt action next door: an unbounded
+        # download does not fail, it hangs, and a job that hangs tells you nothing.
+        # Ten minutes is ~35x the normal duration, so it only fires on a real stall.
+        #
+        # Browsers only. With the libraries installed above, this step is a no-op on a
+        # cache hit, which is what makes the bound meaningful: it now guards one fetch
+        # rather than a fetch and an unbounded package install sharing a single budget.
+        timeout-minutes: 10
+        run: npx playwright install chromium
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+      - name: Start frontend (same-origin /api proxy → backend)
+        working-directory: frontend
+        run: |
+          npm run start -- --port 3000 &
+          echo $! > /tmp/web.pid
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000/login && break || sleep 1;
+          done
+      - name: Run golden E2E (Playwright)
+        working-directory: frontend
+        env:
+          E2E_NO_SERVER: "1"
+          E2E_BASE_URL: http://localhost:3000
+        run: npm run e2e
+      - name: Worker log (on failure)
+        # A golden journey that fails on "Waiting for the pipeline to start…" is telling
+        # you the worker never ran the task, not that SSE broke. Print its log so the
+        # next person reads that from the job output instead of inferring it.
+        if: failure()
+        run: tail -100 /tmp/worker.log || echo "no worker log"
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+  # A committed eval result is evidence, and evidence is write-once. This job exists
+  # because `cbde168` — a *frontend* commit ("replace TopNav with SideNav") — silently
+  # overwrote `eval-2026-08-13.json`, destroying a real 10/10 ollama measurement and
+  # leaving the README citing numbers whose proof no longer existed. Nothing failed; the
+  # loss was invisible until someone diffed the blob out of git history.
+  #
+  # Adding a new result file is always fine. Changing one that is already committed is
+  # not: record a new run under a new name (`eval-<date>-<routing>-run<N>.json`), because
+  # a date alone is not a unique run identity.
+  eval-artifacts:
+    name: Eval results are write-once
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # need the merge base to diff against
+      - name: Fail if a committed eval result was modified
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "No usable base ref; skipping (first push or shallow history)."
+            exit 0
+          fi
+          # Release-audit output is the same kind of evidence (RELEASE.md, "Reading the
+          # audit"): what the audit measured about a published release. The record.md beside
+          # it is a working document and stays editable; only the measurements are frozen.
+          modified=$(git diff --name-only --diff-filter=M "$base" HEAD -- \
+            backend/evals/results/ 'release-audit/*/*.json')
+          if [ -n "$modified" ]; then
+            echo "::error::Committed evidence was modified. It is write-once:"
+            echo "$modified"
+            echo "Commit a new file under a new name instead of overwriting a measurement."
+            exit 1
+          fi
+          echo "No committed eval result or release-audit measurement was modified."

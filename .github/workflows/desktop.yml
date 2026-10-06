@@ -1,0 +1,594 @@
+name: Desktop
+
+# M9 (docs/12): the desktop app is two artifacts — the Python sidecar (PyInstaller
+# one-dir) and the Tauri shell. This workflow builds and smoke-tests BOTH on all three
+# target OSes so a broken bundle can never reach a release tag.
+
+on:
+  push:
+    branches: [main]
+    # A `v*` tag additionally publishes the bundles to a GitHub Release (docs/17 §5).
+    # Branch and PR runs keep uploading 14-day artifacts and publish nothing, so the
+    # build that gates a merge is the same build that ships.
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # the release job attaches bundles to a GitHub Release
+
+jobs:
+  sidecar:
+    name: Sidecar (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      # A tag publishes what this job builds, and the installers are named from
+      # `tauri.conf.json`, not from the tag. Checked before anything is built, so a tag pushed
+      # ahead of its version bump fails here rather than releasing installers labelled with
+      # the previous version. `release.yml` runs the same guard for the images.
+      - name: The tag names VERSION
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: python scripts/sync_version.py --tag "$GITHUB_REF_NAME"
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt pyinstaller
+      # Before pyinstaller, not after: `research-sidecar.spec` names `research_engine._build`
+      # as a hidden import, and the module has to exist for the frozen app to carry its own
+      # commit. Without it the packaged app answers `unknown` when asked what it is.
+      - name: Stamp the build with this commit
+        run: python scripts/stamp_build.py
+      - name: Build one-dir bundle
+        working-directory: backend
+        run: pyinstaller desktop/research-sidecar.spec --noconfirm
+      - name: Smoke — handshake, token gate, watchdog flag
+        working-directory: backend
+        shell: bash
+        env:
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          set -e
+          BIN=dist/research-sidecar/research-sidecar
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN="$BIN.exe"; fi
+          "$BIN" --fake > /tmp/sidecar.log 2>&1 &
+          PID=$!
+          # Wait for the handshake line.
+          for i in $(seq 1 60); do
+            grep -q '"ready": true' /tmp/sidecar.log && break
+            kill -0 $PID || { cat /tmp/sidecar.log; exit 1; }
+            sleep 1
+          done
+          grep -q '"ready": true' /tmp/sidecar.log || { cat /tmp/sidecar.log; exit 1; }
+          PORT=$(sed -n 's/.*"port": \([0-9]*\).*/\1/p' /tmp/sidecar.log | head -1)
+          TOKEN=$(sed -n 's/.*"token": "\([^"]*\)".*/\1/p' /tmp/sidecar.log | head -1)
+          # The handshake prints just before uvicorn binds — wait for the socket.
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null "http://127.0.0.1:$PORT/api/v1/auth/me" && break
+            kill -0 $PID || { cat /tmp/sidecar.log; exit 1; }
+            sleep 1
+          done
+          # The DoD security assertion: an unauthenticated localhost request is rejected.
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/v1/auth/me")
+          [ "$CODE" = "401" ] || { echo "expected 401 without token, got $CODE"; exit 1; }
+          # And the token unlocks the same endpoint.
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/auth/me")
+          [ "$CODE" = "200" ] || { echo "expected 200 with token, got $CODE"; exit 1; }
+          echo "PORT=$PORT" >> "$GITHUB_ENV"
+          echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          echo "SIDECAR_PID=$PID" >> "$GITHUB_ENV"
+          echo "sidecar smoke passed on $RUNNER_OS"
+      - name: Smoke — the frozen binary reports the commit that built it
+        # DoD #7/#9/#17/#19 ("bundled desktop engine exposes its exact SHA", "CI fails if
+        # revisions differ"): `stamp_build.py` runs before `pyinstaller` above specifically
+        # so the frozen app can answer this, but until now nothing asserted the answer was
+        # *right* — only that the app started. A stamping bug that silently wrote yesterday's
+        # SHA, or a stale `research_engine/_build.py` left over from a previous local build
+        # baked into this runner's cache, would both pass every other check in this job.
+        #
+        # Verified by hand before being written here (`internal/plans/13_
+        # One_Runtime_Two_Hosts.md` §0.10): a real PyInstaller build on this exact spec,
+        # launched with no server environment variables, answering /version with the
+        # building commit's SHA. This step is that same check, run on every push instead of
+        # once by a person.
+        shell: bash
+        run: |
+          set -e
+          got=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/version" \
+            | python -c "import json,sys; print(json.load(sys.stdin)['git_sha'])")
+          if [ "$got" != "$GITHUB_SHA" ]; then
+            echo "::error::frozen sidecar reports git_sha=$got, this build is $GITHUB_SHA"
+            exit 1
+          fi
+          echo "frozen sidecar confirms its own commit: $got"
+      - name: Smoke — a run reaches a bundle the standalone verifier passes
+        # Issue #50: the bundle route was added to the sidecar and only ever exercised
+        # through ASGI, from a checkout that has every package the spec *excludes*. A
+        # source-level test structurally cannot catch a missing import in the bundle, and
+        # the documented failure mode of this repository is exactly that — three copies of
+        # the sidecar's location wrong at once, CI green, the app dead on first launch.
+        #
+        # So this drives the packaged binary the way the app does: create, both gates,
+        # export, and then the shipped verifier's own verdict on what came out. It reaches
+        # `build_graph`, the audit-log writes behind the approval chain, and the bundle
+        # assembler — none of which the token check above touches.
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          B="http://127.0.0.1:$PORT/api/v1"
+          H="Authorization: Bearer $TOKEN"
+          api() { curl -sf -H "$H" -H 'Content-Type: application/json' "$@"; }
+
+          PID_JSON=$(api -X POST -d '{"name":"CI"}' "$B/projects")
+          PROJECT=$(python -c "import json,sys;print(json.loads(sys.argv[1])['id'])" "$PID_JSON")
+
+          RUN_JSON=$(api -X POST "$B/runs" -d "{\"project_id\":\"$PROJECT\",\"question\":\"What are the leading approaches to long-term memory in LLM agents?\",\"depth\":\"fast\",\"skip_plan_gate\":false,\"dispatch\":true}")
+          RUN=$(python -c "import json,sys;print(json.loads(sys.argv[1])['run_id'])" "$RUN_JSON")
+          echo "run $RUN created"
+
+          # `dispatch: true` on this host means an in-process asyncio task, not a broker.
+          await_status() {
+            for _ in $(seq 1 180); do
+              s=$(api "$B/runs/$RUN" | python -c "import json,sys;print(json.load(sys.stdin)['run']['status'])")
+              [ "$s" = "$1" ] && { echo "reached $1"; return 0; }
+              case "$s" in FAILED|CANCELLED) echo "::error::run ended $s while waiting for $1"; return 1;; esac
+              sleep 1
+            done
+            echo "::error::run never reached $1 (last: $s)"; return 1
+          }
+
+          await_status AWAITING_PLAN
+          api -X POST -d '{"decision":"APPROVED"}' "$B/runs/$RUN/plan-review" > /dev/null
+          await_status AWAITING_REVIEW
+          api -X POST -d '{"decision":"APPROVED"}' "$B/runs/$RUN/report-review" > /dev/null
+
+          # Written into the working directory, not /tmp. Git Bash on Windows maps `/tmp`
+          # onto its own installation prefix while the Windows Python two lines down
+          # resolves the same string literally against the current drive — so `curl -o
+          # /tmp/x` and `open("/tmp/x")` name different files, and the check below failed
+          # with FileNotFoundError on a bundle that had downloaded perfectly.
+          curl -sf -H "$H" "$B/runs/$RUN/bundle.json" -o ci.bundle.json
+          curl -sf -H "$H" "$B/runs/$RUN/export.md" -o ci-report.md
+          test -s ci-report.md
+
+          # PDF is deliberately unavailable on this host — WeasyPrint is excluded from the
+          # bundle. A 501 is the contract; a 200 would mean the exclude stopped working.
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$B/runs/$RUN/export.pdf")
+          [ "$CODE" = "501" ] || { echo "::error::expected 501 for desktop PDF, got $CODE"; exit 1; }
+
+          # The verdict that matters, from the verifier as a third party would run it.
+          python -m research_engine.verify_bundle ci.bundle.json
+          python - <<'CHECK'
+          import json
+          b = json.load(open("ci.bundle.json"))
+          actions = [a["action"] for a in b["approval_chain"]]
+          assert "approved" in actions, f"no report approval in the chain: {actions}"
+          assert b["evidence"], "the packaged app produced a bundle with no evidence"
+          assert b["demo"] is True, "a scripted run must be stamped as a demo"
+          print("approval chain:", actions, "| evidence:", len(b["evidence"]))
+          CHECK
+          echo "packaged-app research journey verified on $RUNNER_OS"
+      - name: Smoke — V3's release invariants hold in the frozen app
+        # What V3 ships to users that the ASGI tests cannot vouch for, checked in the binary
+        # itself (scope freeze §9, §12): the bundle format every run now emits, the one route
+        # Settings → Agents reads, and a saved customisation reaching the next run's bundle.
+        # The run above was uncustomised, so it must be v2 with provenance and nothing
+        # replaced; the run here is customised, so it must say exactly what was replaced.
+        working-directory: backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          B="http://127.0.0.1:$PORT/api/v1"
+          H="Authorization: Bearer $TOKEN"
+          api() { curl -sf -H "$H" -H 'Content-Type: application/json' "$@"; }
+
+          python - <<'CHECK'
+          import json
+          b = json.load(open("ci.bundle.json"))
+          assert b["bundle_version"] == 2, f"a V3 run emitted bundle v{b['bundle_version']}"
+          assert b["prompt_overrides_status"] == "NONE", b["prompt_overrides_status"]
+          assert b["prompt_provenance"], "a V3 run recorded no prompt provenance"
+          replaced = [r["purpose"] for r in b["prompt_provenance"] if r["overridden"]]
+          assert not replaced, f"an uncustomised run claims replaced prompts: {replaced}"
+          print("uncustomised run: v2, NONE,", len(b["prompt_provenance"]), "purposes recorded")
+          CHECK
+
+          api "$B/models/prompt-defaults" -o prompt-defaults.json
+          python - <<'CHECK'
+          import json
+          d = json.load(open("prompt-defaults.json"))
+          roles = [r["role"] for r in d["roles"]]
+          assert roles == ["planner", "executor", "critic", "synthesizer", "chat"], roles
+          assert d["max_chars"] == 2500, d["max_chars"]
+          assert all(r["default_prompt"].strip() for r in d["roles"]), "an empty shipped prompt"
+          print("prompt-defaults: five roles, limit", d["max_chars"])
+          CHECK
+
+          api -X PATCH "$B/auth/me" \
+            -d '{"preferences":{"prompt_overrides":{"planner":"Plan exactly three research tasks."}}}' > /dev/null
+          PID_JSON=$(api -X POST -d '{"name":"CI customised"}' "$B/projects")
+          PROJECT=$(python -c "import json,sys;print(json.loads(sys.argv[1])['id'])" "$PID_JSON")
+          RUN_JSON=$(api -X POST "$B/runs" -d "{\"project_id\":\"$PROJECT\",\"question\":\"What are the leading approaches to long-term memory in LLM agents?\",\"depth\":\"fast\",\"skip_plan_gate\":false,\"dispatch\":true}")
+          RUN=$(python -c "import json,sys;print(json.loads(sys.argv[1])['run_id'])" "$RUN_JSON")
+          await_status() {
+            for _ in $(seq 1 180); do
+              s=$(api "$B/runs/$RUN" | python -c "import json,sys;print(json.load(sys.stdin)['run']['status'])")
+              [ "$s" = "$1" ] && return 0
+              case "$s" in FAILED|CANCELLED) echo "::error::run ended $s while waiting for $1"; return 1;; esac
+              sleep 1
+            done
+            echo "::error::run never reached $1 (last: $s)"; return 1
+          }
+          await_status AWAITING_PLAN
+          api -X POST -d '{"decision":"APPROVED"}' "$B/runs/$RUN/plan-review" > /dev/null
+          await_status AWAITING_REVIEW
+          api -X POST -d '{"decision":"APPROVED"}' "$B/runs/$RUN/report-review" > /dev/null
+          curl -sf -H "$H" "$B/runs/$RUN/bundle.json" -o ci-customised.bundle.json
+
+          python -m research_engine.verify_bundle ci-customised.bundle.json
+          python - <<'CHECK'
+          import json
+          b = json.load(open("ci-customised.bundle.json"))
+          assert b["bundle_version"] == 2, b["bundle_version"]
+          assert b["prompt_overrides_status"] == "APPLIED", b["prompt_overrides_status"]
+          replaced = [r for r in b["prompt_provenance"] if r["overridden"]]
+          assert [r["purpose"] for r in replaced] == ["planner.main"], replaced
+          assert "Plan exactly three research tasks." in replaced[0]["effective_prompt"]
+          print("customised run: v2, APPLIED, replaced", [r["purpose"] for r in replaced])
+          CHECK
+          kill "$SIDECAR_PID" || true
+          echo "V3 release invariants verified in the frozen app on $RUNNER_OS"
+      - name: Upload sidecar bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: research-sidecar-${{ matrix.os }}
+          path: backend/dist/research-sidecar/
+          retention-days: 14
+
+  shell:
+    name: Shell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # The bundler copies `backend/dist/research-sidecar/` in as a resource, so the sidecar
+    # has to exist before `tauri build` runs. Without this the two jobs raced and the shell
+    # always won, producing a 5 MB bundle with no backend that failed on first launch.
+    needs: sidecar
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch the sidecar built for this OS
+        uses: actions/download-artifact@v8
+        with:
+          name: research-sidecar-${{ matrix.os }}
+          path: backend/dist/research-sidecar/
+      - name: Restore the sidecar's executable bit
+        if: runner.os != 'Windows'
+        # upload-artifact does not preserve POSIX permissions, so the launcher comes back
+        # mode 644 and the app cannot exec it.
+        run: chmod +x backend/dist/research-sidecar/research-sidecar
+      - name: Linux build dependencies (WebKitGTK etc.)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/apt-install
+        # Hard ceiling over the action's own per-attempt bounds — see ci.yml. This is the
+        # only call site that does real work: the WeasyPrint pair is already on the runner
+        # image, while none of these -dev packages are, so this is where both the refresh
+        # and a several-hundred-megabyte install actually happen. Sized to allow every
+        # attempt the action permits rather than to the observed happy path.
+        timeout-minutes: 35
+        with:
+          packages: >-
+            libwebkit2gtk-4.1-dev build-essential curl wget file
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Install shell dependencies
+        working-directory: desktop
+        run: npm install
+      - name: Build Tauri app (bundles the static export; runs cargo build)
+        working-directory: desktop
+        run: npx tauri build
+      - name: The bundle actually contains the backend
+        shell: bash
+        # AGENTS.md's worked example of a green build that died on first launch: all three
+        # copies of the sidecar's location were wrong at once, `tauri build` succeeded, the
+        # artifact uploaded cleanly, and the app shipped at ~5 MB with no backend inside.
+        # Building is not the assertion — what ended up in the bundle is.
+        #
+        # The two branches are not laziness about Windows. macOS produces a real directory
+        # (`.app/Contents/Resources/sidecar/`) whose contents can be inspected directly, so
+        # they are. An `.msi` is a compressed archive with the payload inside it, so the
+        # only honest check without installing it is its size — which still catches the
+        # failure being guarded, because 5 MB does not compress out of 140.
+        run: |
+          set -euo pipefail
+          out=desktop/target/release/bundle
+          found=$(find "$out" -type f \
+            \( -name 'research-sidecar' -o -name 'research-sidecar.exe' \) -print -quit)
+
+          if [ -n "$found" ]; then
+            root=$(dirname "$found")
+            total=$(du -sk "$root" | cut -f1)
+            echo "sidecar tree at $root: ${total} KiB"
+            # 60 MB floor against a real 140-200 MB tree: far enough below that a
+            # dependency drop does not fail the build, far enough above 5 MB that the
+            # failure cannot pass.
+            if [ "$total" -lt 61440 ]; then
+              echo "::error::sidecar tree is ${total} KiB — too small to contain the engine"
+              exit 1
+            fi
+            exit 0
+          fi
+
+          # No loose executable: the payload is packed into an installer.
+          biggest=$(find "$out" -type f \
+            \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+            -exec du -k {} + | sort -rn | head -1)
+          if [ -z "$biggest" ]; then
+            echo "::error::no installer and no sidecar in the bundle output"
+            find "$out" -maxdepth 4
+            exit 1
+          fi
+          size=$(echo "$biggest" | cut -f1)
+          name=$(echo "$biggest" | cut -f2-)
+          echo "largest installer: $name (${size} KiB)"
+          # 40 MB: an installer compresses the same payload, so the floor sits lower than
+          # the uncompressed one above and still an order of magnitude above the failure.
+          if [ "$size" -lt 40960 ]; then
+            echo "::error::$name is ${size} KiB — too small to contain the engine"
+            exit 1
+          fi
+      - name: The copy actually inside the bundle reports the commit that built it
+        if: runner.os == 'macOS'
+        shell: bash
+        # The `sidecar` job already asserts this of the raw PyInstaller output (the
+        # earlier step of the same name, above). This is the narrower, only-on-macOS
+        # question that step cannot answer: did the *copy* `tauri build` embedded at
+        # `Contents/Resources/sidecar/` — the one a user's machine actually launches —
+        # come out identical, or did the resource step silently pick up something else?
+        # AGENTS.md's documented failure was exactly a wrong copy location; a wrong
+        # *copy contents* at the right location would look identical to every check that
+        # only measures size. Windows/.msi and Linux/AppImage.deb are packed archives —
+        # the same reason the size check above only inspects macOS directly — so this
+        # stays macOS-only rather than guess at extracting the other two.
+        run: |
+          set -euo pipefail
+          bin=$(find desktop/target/release/bundle/macos -type f -name research-sidecar -print -quit)
+          if [ -z "$bin" ]; then
+            echo "::error::no research-sidecar binary found inside the .app bundle"
+            exit 1
+          fi
+          "$bin" --fake > /tmp/bundled-sidecar.log 2>&1 &
+          PID=$!
+          for i in $(seq 1 60); do
+            grep -q '"ready": true' /tmp/bundled-sidecar.log && break
+            kill -0 $PID || { cat /tmp/bundled-sidecar.log; exit 1; }
+            sleep 1
+          done
+          PORT=$(sed -n 's/.*"port": \([0-9]*\).*/\1/p' /tmp/bundled-sidecar.log | head -1)
+          TOKEN=$(sed -n 's/.*"token": "\([^"]*\)".*/\1/p' /tmp/bundled-sidecar.log | head -1)
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null "http://127.0.0.1:$PORT/api/v1/auth/me" && break
+            sleep 1
+          done
+          got=$(curl -sf -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/version" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['git_sha'])")
+          kill "$PID" || true
+          if [ "$got" != "$GITHUB_SHA" ]; then
+            echo "::error::the bundled sidecar copy reports git_sha=$got, this build is $GITHUB_SHA"
+            exit 1
+          fi
+          echo "bundled sidecar copy confirms its own commit: $got"
+      - name: The app inside the published disk image has a valid signature
+        if: runner.os == 'macOS'
+        shell: bash
+        # Every macOS build from 1.0.1 to 3.0.0 shipped with only the signature the linker
+        # stamps on an arm64 executable: nothing signed the bundle, so its resources were
+        # unsealed and `codesign --verify` failed with "code has no resources but signature
+        # indicates they must be present". A copy downloaded by a browser carries the
+        # quarantine flag, and Gatekeeper reports a quarantined app whose signature fails
+        # verification as "damaged and can't be opened" — no Open Anyway, only the Trash.
+        # Every earlier check passed, because none of them looked at the signature, and
+        # none of them saw what a downloaded copy sees.
+        #
+        # `bundle.macOS.signingIdentity: "-"` in tauri.conf.json now ad-hoc signs the whole
+        # bundle before the image is built. This checks the image itself — the file users
+        # download — rather than the build directory, and asks Gatekeeper about a
+        # quarantined copy: a valid but un-notarized signature gets a policy verdict
+        # ("rejected", cleared by Open Anyway), while a broken one gets the damage message.
+        run: |
+          set -euo pipefail
+          dmg=$(find desktop/target/release/bundle/dmg -name '*.dmg' -print -quit)
+          if [ -z "$dmg" ]; then
+            echo "::error::no .dmg in the bundle output"
+            exit 1
+          fi
+          mnt=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -noverify -mountpoint "$mnt" "$dmg" >/dev/null
+          trap 'hdiutil detach -quiet "$mnt" || true' EXIT
+          app=$(find "$mnt" -maxdepth 1 -name '*.app' -print -quit)
+          if [ -z "$app" ]; then
+            echo "::error::no .app inside $dmg"
+            exit 1
+          fi
+          info=$(codesign -dv "$app" 2>&1 || true)
+          echo "$info" | grep -E 'flags=|Signature=|Sealed Resources' || true
+          if echo "$info" | grep -q 'linker-signed'; then
+            echo "::error::$(basename "$app") carries only the linker's signature — macOS reports a downloaded copy as damaged"
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app"
+          copy="$(mktemp -d)/$(basename "$app")"
+          ditto "$app" "$copy"
+          xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Safari;" "$copy"
+          verdict=$(spctl --assess --type execute -vv "$copy" 2>&1 || true)
+          echo "Gatekeeper on a quarantined copy: $verdict"
+          if ! echo "$verdict" | grep -qE ': (rejected|accepted)$'; then
+            echo "::error::Gatekeeper does not reach a policy verdict — a downloaded copy would be reported as damaged"
+            exit 1
+          fi
+      # The three steps below are the Linux and Windows halves of the two macOS steps above.
+      # Until they existed, "Linux and Windows passed CI" meant the installers *compiled*: the
+      # engine was smoke-tested as raw PyInstaller output in the sidecar job, and the size
+      # check only proved something large was packed. Nothing had ever installed a .deb or
+      # an .msi, or unpacked an AppImage, and run what came out. Each now does exactly that
+      # and drives the engine it finds through both gates to an approved, exported run
+      # (`scripts/check_packaged_sidecar.py`, the same checker a person runs against a
+      # published installer in RELEASE.md). The desktop UI itself needs a display and is
+      # still checked by hand.
+      - name: The installed .deb carries a working engine that reports this commit
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb=$(find desktop/target/release/bundle/deb -name '*.deb' -print -quit)
+          if [ -z "$deb" ]; then echo "::error::no .deb in the bundle output"; exit 1; fi
+          pkg=$(dpkg-deb -f "$deb" Package)
+          # dpkg, not apt: the build step already installed every runtime library the
+          # package depends on, and a missing one should fail here by name.
+          sudo dpkg -i "$deb"
+          bin=$(dpkg -L "$pkg" | grep '/research-sidecar$' | head -1)
+          if [ -z "$bin" ]; then echo "::error::the installed $pkg has no research-sidecar"; exit 1; fi
+          python3 scripts/check_packaged_sidecar.py --bin "$bin" \
+            --expect-sha "$GITHUB_SHA" --expect-version "$(tr -d '[:space:]' < VERSION)" --journey
+          sudo dpkg -r "$pkg"
+          if [ -e "$bin" ]; then echo "::error::removing $pkg left $bin behind"; exit 1; fi
+      - name: The AppImage carries a working engine that reports this commit
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          img=$(find "$PWD/desktop/target/release/bundle/appimage" -name '*.AppImage' -print -quit)
+          if [ -z "$img" ]; then echo "::error::no .AppImage in the bundle output"; exit 1; fi
+          chmod +x "$img"
+          # The AppImage runtime unpacks itself without FUSE, which a runner does not have.
+          work=$(mktemp -d)
+          (cd "$work" && "$img" --appimage-extract > /dev/null)
+          python3 scripts/check_packaged_sidecar.py --search "$work/squashfs-root" \
+            --expect-sha "$GITHUB_SHA" --expect-version "$(tr -d '[:space:]' < VERSION)" --journey
+      - name: The installed .msi carries a working engine that reports this commit
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Get-ChildItem desktop/target/release/bundle/msi -Filter *.msi | Select-Object -First 1
+          if (-not $msi) { throw "no .msi in the bundle output" }
+          $log = Join-Path $env:RUNNER_TEMP 'msi-install.log'
+          # A real per-machine install, silent, as a user's double-click would do it.
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/i', "`"$($msi.FullName)`"", '/qn', '/norestart', '/l*v', "`"$log`"")
+          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 80; throw "msiexec /i exited $($p.ExitCode)" }
+          $roots = @((Join-Path $env:ProgramFiles 'Research Assistant'), $env:ProgramFiles,
+                     (Join-Path $env:LOCALAPPDATA 'Programs'))
+          $sidecar = $roots | Where-Object { Test-Path $_ } | ForEach-Object {
+            Get-ChildItem -Path $_ -Recurse -Filter research-sidecar.exe -ErrorAction SilentlyContinue
+          } | Select-Object -First 1
+          if (-not $sidecar) { Get-Content $log -Tail 80; throw "the installed app has no research-sidecar.exe" }
+          Write-Host "installed engine: $($sidecar.FullName)"
+          python scripts/check_packaged_sidecar.py --bin $sidecar.FullName `
+            --expect-sha $env:GITHUB_SHA --expect-version (Get-Content VERSION).Trim() --journey
+          if ($LASTEXITCODE -ne 0) { throw "the installed engine failed its check" }
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/x', "`"$($msi.FullName)`"", '/qn', '/norestart')
+          if ($p.ExitCode -ne 0) { throw "msiexec /x exited $($p.ExitCode)" }
+          if (Test-Path $sidecar.FullName) { throw "uninstalling left $($sidecar.FullName) behind" }
+      - name: Upload shell bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: research-desktop-shell-${{ matrix.os }}
+          path: |
+            desktop/target/release/bundle/
+          retention-days: 14
+
+  release:
+    name: Publish release
+    # Only on a version tag. Every other trigger stops at the 14-day artifacts above.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [sidecar, shell]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download every shell bundle
+        uses: actions/download-artifact@v8
+        with:
+          pattern: research-desktop-shell-*
+          path: artifacts
+      - name: Collect installers and checksum them
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Bundle layouts differ per OS (dmg/, msi/, appimage/, deb/), so collect by
+          # extension rather than by path and flatten into one directory.
+          find artifacts -type f \
+            \( -name '*.dmg' -o -name '*.msi' -o -name '*.AppImage' -o -name '*.deb' \) \
+            -exec cp {} release/ \;
+          cd release
+          # Squeeze spaces out of the names BEFORE hashing. The bundler names files after
+          # productName ("Research Assistant_1.0.1_aarch64.dmg"), and GitHub rewrites the
+          # space to a dot when it serves the asset — so a SHA256SUMS generated from the
+          # original names lists a file nobody can download under that name, and
+          # `shasum -c` answers "no file was verified". The hashes were right; the names
+          # were not, which is worse than shipping no checksums at all.
+          for f in *\ *; do [ -e "$f" ] && mv "$f" "${f// /.}"; done
+          # An unsigned artifact that also cannot be verified is worse than an unsigned
+          # one that can: the checksum is what lets a careful user confirm the download
+          # matches what CI produced (docs/17 §5).
+          sha256sum * > SHA256SUMS
+          echo "--- published artifacts ---"
+          cat SHA256SUMS
+      - name: Fail if no installers were produced
+        run: |
+          # A green release with an empty asset list is the worst outcome: it looks like
+          # a successful ship and hands users nothing.
+          count=$(find release -type f ! -name SHA256SUMS | wc -l)
+          echo "installer count: $count"
+          test "$count" -gt 0
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release/*
+          draft: false
+          # Pre-release for anything carrying a suffix (v1.0.0-rc1, -beta). Unsigned
+          # desktop bundles are new territory here; the tag decides, not a human.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          # Appended, never assigned — see the same flag in release.yml. Both workflows
+          # publish to one release on one tag, and assigning `body` from both meant the
+          # slower job erased the faster one's content.
+          append_body: true
+          body: |
+            ## Desktop bundles for ${{ github.ref_name }}
+
+            **These builds are not code-signed.** Your OS will warn you on first launch:
+
+            | OS | What you will see | What to do |
+            |---|---|---|
+            | macOS | A block on first launch — the app is not signed with an Apple Developer ID or notarized | Drag the app to Applications, then run `xattr -dr com.apple.quarantine "/Applications/Research Assistant.app"` in Terminal once |
+            | Windows | SmartScreen warning | **More info** → **Run anyway** |
+            | Linux | AppImage is not executable | `chmod +x *.AppImage` (`.deb` needs nothing) |
+
+            Verify your download against `SHA256SUMS` before running it:
+
+            ```
+            sha256sum -c SHA256SUMS --ignore-missing
+            ```
+
+            **Research bundles from v3.0.0 onward are format v2, and a verifier from before
+            v3.0.0 refuses them.** Check a bundle with the `verify_bundle` shipped in this
+            release; it still verifies every earlier (v1) bundle, unchanged.

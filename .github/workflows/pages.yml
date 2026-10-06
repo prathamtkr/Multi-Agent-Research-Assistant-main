@@ -1,0 +1,209 @@
+name: Pages
+
+# Publishes the public site to GitHub Pages: the landing page, the comparison against
+# NotebookLM and friends, the full documentation set, and the download instructions.
+#
+# **This used to be one hand-written `site/index.html` with no build step.** That was a
+# deliberate choice — nothing to compile, no dependency that can rot — and it failed the
+# way hand-maintained duplicates always do: it described a pipeline with one human gate
+# for weeks after the design gate shipped, because updating it was a separate act of
+# memory from changing the product.
+#
+# So the site is now generated from the app's own `(site)` route group. The docs are the
+# same `docs/` markdown the app renders, through the same renderer; the comparison is the
+# same `lib/comparison.ts` the app imports; the colours are `globals.css`, both themes,
+# rather than a second palette that drifts. Nothing here can describe a version of the
+# product that does not exist, because it is built from the product.
+#
+# The cost is a build step, and that is the trade being made knowingly.
+
+on:
+  push:
+    branches: [main]
+    # Widened from `site/**`: the site is now generated, so anything it is generated
+    # *from* must republish it. A docs edit that never reached the published site was the
+    # exact failure this file is being changed to prevent.
+    paths:
+      - "frontend/**"
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time. `cancel-in-progress: false` because cancelling a half-finished
+# Pages deployment can leave the live site on an older commit than the queue implies.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  # Build and deploy are separate jobs on purpose. With both in one job, re-running it
+  # after a failed deploy re-runs the upload too, and `deploy-pages` then finds two
+  # artifacts named "github-pages" and refuses with "Artifact count is 2" — so the retry
+  # for a transient outage is itself guaranteed to fail. Found exactly that way, during a
+  # real GitHub Pages 503.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Stage a copy without the app routes
+        # Built from a *copy* so the checkout is never mutated. The `(app)` group and
+        # `/login` need a backend and a session; exporting them would publish a shell that
+        # looks like the product and cannot do anything. Deleting them from a scratch copy
+        # is safer than a stash-and-restore that can leave the tree mangled if the build
+        # dies midway.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pages
+          cp -R frontend /tmp/pages/frontend
+          cp -R docs /tmp/pages/docs
+          rm -rf "/tmp/pages/frontend/app/(app)" /tmp/pages/frontend/app/login
+          rm -rf /tmp/pages/frontend/.next /tmp/pages/frontend/out
+
+      - name: Resolve where the site is served from
+        # Two ways this site can be published, and they need opposite base paths:
+        #
+        #   project page      https://<user>.github.io/<repo>/   basePath=/<repo>
+        #   custom domain     https://<domain>/                  basePath=""
+        #
+        # A root file decides, matching how `VERSION` is the one place a human edits and
+        # everything else derives (`scripts/sync_version.py`). Absent or empty — which is
+        # the committed state — means today's project-page behaviour exactly, so this is
+        # inert until someone claims a domain and writes it down.
+        #
+        # Getting this wrong is not subtle but it *is* silent: with a basePath under a
+        # custom domain every asset resolves one level too high, and with no basePath on a
+        # project page the same happens in reverse. AGENTS.md records the narrower version
+        # of this — `metadata.icons` is not covered by basePath, so the favicon 404'd at
+        # the domain root while serving fine one level down.
+        id: site
+        run: |
+          set -euo pipefail
+          domain=""
+          if [ -f CUSTOM_DOMAIN ]; then
+            domain=$(tr -d '[:space:]' < CUSTOM_DOMAIN)
+          fi
+          if [ -n "$domain" ]; then
+            echo "base_path=" >> "$GITHUB_OUTPUT"
+            echo "domain=$domain" >> "$GITHUB_OUTPUT"
+            echo "site_url=https://$domain" >> "$GITHUB_OUTPUT"
+            echo "serving at the root of $domain"
+          else
+            echo "base_path=/${{ github.event.repository.name }}" >> "$GITHUB_OUTPUT"
+            echo "domain=" >> "$GITHUB_OUTPUT"
+            echo "site_url=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}" >> "$GITHUB_OUTPUT"
+            echo "serving as a project page under /${{ github.event.repository.name }}/"
+          fi
+
+      - name: Build the static site
+        working-directory: /tmp/pages/frontend
+        env:
+          # Pages serves a project site from /<repo>/, not the domain root. Without the
+          # prefix every internal link and asset resolves one level too high and 404s.
+          # Empty when CUSTOM_DOMAIN names a domain — see the step above.
+          NEXT_PUBLIC_BASE_PATH: ${{ steps.site.outputs.base_path }}
+          # The origin `robots.txt`, `sitemap.xml` and every page's canonical/OG URL are
+          # built from (`frontend/lib/pages-build.ts`). Resolved here from the same
+          # CUSTOM_DOMAIN check as base_path, so the two can never name different sites —
+          # the sitemap pointing at one origin while every page's own canonical tag points
+          # at another is the same class of bug the base-path mismatch above already is.
+          NEXT_PUBLIC_SITE_URL: ${{ steps.site.outputs.site_url }}
+        run: npm run build:pages
+
+      - name: Stamp the export with what it was built from
+        # GitHub's deployment record says which commit a workflow *deployed*; this says which
+        # build the CDN is actually *serving*, read back from the live site by the release
+        # audit (RELEASE.md, A17.02). Before it existed, nothing on the site could say whether
+        # the page a visitor saw was built from the release commit or from a week earlier.
+        run: |
+          printf '{"commit":"%s","version":"%s","built_at":"%s","run":"%s"}\n' \
+            "$GITHUB_SHA" "$(tr -d '[:space:]' < VERSION)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            > /tmp/pages/frontend/out/build.json
+          cat /tmp/pages/frontend/out/build.json
+
+      - name: Tell GitHub Pages the custom domain
+        # Pages reads this file from the published artifact; without it a custom domain
+        # serves the wrong site or none. Written from the same single source that decided
+        # the base path, so the two can never disagree — which is the actual failure mode
+        # (a CNAME present with a project-page basePath still 404s every asset).
+        if: steps.site.outputs.domain != ''
+        run: echo "${{ steps.site.outputs.domain }}" > /tmp/pages/frontend/out/CNAME
+
+      - name: Fail if the export is empty or missing pages
+        # A green deploy that published nothing looks like success and serves a 404. Each
+        # of these is a page the site promises in its own nav, so a missing one is a
+        # broken link shipped to the front door.
+        run: |
+          set -euo pipefail
+          out=/tmp/pages/frontend/out
+          for page in index.html why/index.html docs/index.html download/index.html 404.html; do
+            test -s "$out/$page" || { echo "missing or empty: $page"; exit 1; }
+          done
+          # The docs index is generated from the markdown tree; if that tree was not
+          # visible at build time the page renders an honest "unavailable" notice rather
+          # than a convincing empty index — which would deploy green and say nothing.
+          if grep -q "Documentation is unavailable" "$out/docs/index.html"; then
+            echo "docs tree was not readable at build time"; exit 1
+          fi
+          count=$(find "$out/docs" -name index.html | wc -l)
+          echo "docs pages exported: $count"
+          test "$count" -gt 5
+
+          # robots.txt/sitemap.xml (frontend/app/robots.ts, app/sitemap.ts) are the whole
+          # point of this workflow's SEO surface, and both would still deploy green and
+          # every page would still render if something upstream went wrong — so check their
+          # actual content, not just that a file exists. `app/robots.ts` disallows
+          # everything unless `NEXT_PUBLIC_PAGES` reached the build step above; that branch
+          # firing here means the site just published a robots.txt telling every crawler to
+          # leave, silently, with no other symptom.
+          test -s "$out/robots.txt" || { echo "missing or empty: robots.txt"; exit 1; }
+          test -s "$out/sitemap.xml" || { echo "missing or empty: sitemap.xml"; exit 1; }
+          if ! grep -q "Allow: /" "$out/robots.txt"; then
+            echo "robots.txt disallows crawling — NEXT_PUBLIC_PAGES did not reach the build step"
+            exit 1
+          fi
+          if ! grep -q "${{ steps.site.outputs.site_url }}" "$out/sitemap.xml"; then
+            echo "sitemap.xml does not reference the resolved site_url (${{ steps.site.outputs.site_url }})"
+            exit 1
+          fi
+
+      - name: Disable Jekyll
+        # Pages runs Jekyll by default, which silently drops every path starting with an
+        # underscore — including `_next/`, i.e. all the CSS and JS.
+        run: touch /tmp/pages/frontend/out/.nojekyll
+
+      - uses: actions/configure-pages@v6
+        with:
+          # Provision the Pages site on first run. Without this the action fails with
+          # "Get Pages site failed / Not Found" on a repository where Pages has never
+          # been switched on, which is every repository until someone visits Settings.
+          enablement: true
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: /tmp/pages/frontend/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@v5
